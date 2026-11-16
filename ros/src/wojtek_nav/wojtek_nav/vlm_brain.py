@@ -19,19 +19,37 @@ goal*:
                ALONG THE PIXEL'S BEARING, then look again
              ──blocked──► look again (fresh depth: odometry drifts over a
                long walk, and the target may be right there); blocked
-               again by the goal from that very look ──► search (a turn,
-               a walk or any other result in between starts the count
-               again)
+               again by the goal from that very look ──► approach along
+               the pixel's bearing, detoured 40 deg off it, alternating
+               sides (a turn, a walk or any other result in between
+               starts the count again)
 
   approach ──reached──► look again
            ──blocked──► look again; the next approach detours 40 deg off
              the bearing, alternating sides
            a detoured approach, reached or blocked, first turns back
              onto the bearing and then looks again
-  any move that covers < min_progress_m counts as a stall; max_stalls in a
+  any move that covers < min_progress_m counts as a stall, and so does a
+  blocked goal that leaves the robot no nearer (by min_progress_m) to the
+  target than its best distance so far; max_stalls of either kind in a
   row, more than max_blind approaches in a row that never bring the
   target into the depth window, or the task running longer than max_s,
   end the task as `gave_up` with the reason.
+
+  Why a blocked goal detours instead of turning (seen in the sim on
+  2026-11-16): a 45 deg search turn keeps the target inside the 90 deg
+  picture, the next look points at it again, goto turns straight back
+  onto the blocked line, and the loop repeats until max_s -- 600 s spent
+  1.6 m from the pillar. The detour moves the body off that line; the
+  progress count ends the attempt when the line cannot be left.
+
+Optional detector (SAM3): when the node has a detector, the instruction is
+first turned into a short English concept phrase by the VLM
+(`concept_prompt`); a task with no concrete object to find gets none and
+stays VLM-only. With a phrase, each look asks the detector instead of the
+VLM, and `answer_from_detections` turns its instances into the same
+goal / not_visible answer, so the policy above is unchanged -- including
+the VLM's verify question before anything moves.
 
 The benchmark behind these choices (scripts/point_bench.py on nine sim
 frames): pointing is fine, hallucinated goals on absent objects are the
@@ -79,6 +97,16 @@ VERIFY_SCHEMA = {
     "required": ["visible"],
     "additionalProperties": False,
 }
+# The once-per-task question that turns the instruction into the detector's
+# concept phrase (SAM3 takes a short English noun phrase, not a sentence).
+CONCEPT_SCHEMA = {
+    "type": "object",
+    "properties": {"detectable": {"type": "boolean"}, "prompt": {"type": "string"}},
+    "required": ["detectable", "prompt"],
+    "additionalProperties": False,
+}
+# A concept phrase longer than this is a sentence, not a noun phrase.
+CONCEPT_MAX_WORDS = 6
 
 
 def task_prompt(instruction):
@@ -106,6 +134,76 @@ def verify_prompt(instruction, label):
         "in this photo? Answer {\"visible\": true} only if you can see it. A different object of "
         "another kind, colour or size does not count."
     )
+
+
+def concept_prompt(instruction):
+    """The text-only question asked once per task when a detector is
+    configured: is there one concrete object to find, and what is it called
+    in the detector's language."""
+    return (
+        f"Zadanie od użytkownika: \"{instruction}\".\n"
+        "An open-vocabulary object detector will search the robot's camera images for the "
+        "target of this task. If completing the task means going to a concrete physical "
+        "object (or one kind of object) that can be seen, reply "
+        "{\"detectable\": true, \"prompt\": \"<noun phrase>\"} where the noun phrase is short "
+        "English (1-4 words) naming that object with the visual properties the task gives, "
+        "such as colour, size or material, e.g. \"purple pillar\", \"red chair\", "
+        "\"small cardboard box\". Do not include verbs, places or directions.\n"
+        "If the task has no such object (a direction, a distance, a room, exploring, "
+        "stopping), reply {\"detectable\": false, \"prompt\": \"\"}."
+    )
+
+
+def parse_concept(answer):
+    """The detector phrase from a concept answer, or None: not detectable,
+    empty, or not a short noun phrase."""
+    if not isinstance(answer, dict) or answer.get("detectable") is not True:
+        return None
+    phrase = answer.get("prompt")
+    if not isinstance(phrase, str):
+        return None
+    phrase = " ".join(phrase.split()).strip(" .,\"'")
+    if not phrase or len(phrase.split()) > CONCEPT_MAX_WORDS:
+        return None
+    return phrase
+
+
+def detect_url(base):
+    """The detector's endpoint from its base URL (scripts/sam3_server.py
+    serves POST /detect); a URL that already ends in /detect is kept."""
+    base = base.strip().rstrip("/")
+    return base if base.endswith("/detect") else base + "/detect"
+
+
+def answer_from_detections(detections, label, min_score=0.5, near=None):
+    """The detector's instances as a task answer: a goal on the most
+    confident instance's interior point, or not_visible. With `near`, a
+    normalised (u, v), the instance whose point is closest to it instead:
+    the one already verified, found again in a fresher picture. Instances
+    without a usable score or point are ignored, so a malformed reply is a
+    miss, never a pixel."""
+    best = None
+    for d in detections if isinstance(detections, list) else []:
+        if not isinstance(d, dict):
+            continue
+        try:
+            score = float(d.get("score"))
+            u, v = (float(c) for c in d.get("point"))
+        except (TypeError, ValueError):
+            continue
+        if not (score >= min_score and 0.0 <= u <= 1.0 and 0.0 <= v <= 1.0):
+            continue  # also drops NaN
+        if near is not None:
+            rank = -((u - near[0]) ** 2 + (v - near[1]) ** 2)
+        else:
+            rank = score
+        if best is None or rank > best[3]:
+            best = (score, u, v, rank)
+    if best is None:
+        return {"type": "not_visible"}
+    score, u, v, _ = best
+    return {"type": "goal", "point_2d": [round(u * 1000), round(v * 1000)],
+            "label": label, "score": round(score, 3)}
 
 
 def chat_url(base):
@@ -211,6 +309,8 @@ class Explorer:
         self.stalls = 0       # moves in a row that covered < min_progress_m
         self.detour = 0.0     # deg off the bearing for the next approach
         self.goal_blocks = 0  # blocked goals back to back, with only a look between them
+        self.goal_best = None  # nearest the robot has been to a resolved target (m)
+        self.goal_stalls = 0  # blocked goals in a row with no progress on goal_best
         self._point = None
         self._moving = None   # "approach" / "explore": the move in flight
 
@@ -252,6 +352,13 @@ class Explorer:
         self._point = None
         return self._search()
 
+    def retarget(self, point):
+        """The verified target, found again in a fresher picture (the
+        detector re-run after a slow verify): the goal and any approach
+        that follows use this pixel. -> the goal action to send."""
+        self._point = point
+        return ("goal", point)
+
     def on_goal_result(self, result, distance_m=None):
         """pixel_goal_node's status word for the goal, and the robot's
         distance to the resolved object point (None if unknown)."""
@@ -265,6 +372,15 @@ class Explorer:
             self.blind = 0
             if distance_m is not None and distance_m < self.done_within_m:
                 return ("done",)
+            if distance_m is not None:
+                if self.goal_best is None or distance_m < self.goal_best - self.min_progress_m:
+                    self.goal_best, self.goal_stalls = distance_m, 0
+                elif result == "blocked":
+                    self.goal_stalls += 1
+                    if self.goal_stalls >= self.max_stalls:
+                        return ("gave_up", f"no progress: blocked {self.goal_stalls} times in a row "
+                                           f"without getting {self.min_progress_m:g} m nearer than "
+                                           f"{self.goal_best:.2f} m to the target")
         if result == "reached":
             return ("look",)
         if result == "blocked":
@@ -272,11 +388,22 @@ class Explorer:
             # leg odometry under-reads a long walk (~30 % in the sim), so
             # the robot may stand at the target with odom saying otherwise.
             # A fresh picture resolves it again from here. Twice blocked is
-            # a real obstacle: turn.
+            # a real obstacle on the line: go round it, along the pixel's
+            # bearing turned detour_deg off, alternating sides. Not a search
+            # turn -- the target stays in the picture and the next goal
+            # turns straight back onto the same line.
             self.goal_blocks += 1
             if self.goal_blocks == 1:
                 return ("look",)
-            return self._search()  # which starts the count again
+            self.goal_blocks = 0  # the detour moves the robot: a fresh count
+            if point is None:
+                return self._search()
+            # A blocked detour has already set the other side
+            # (on_move_result); a clear walk reset it to 0.
+            if not self.detour:
+                self.detour = self.detour_deg
+            self._moving = "approach"
+            return ("approach", self.approach_m, point, self.detour)
         if result == "no_depth" and point is not None:
             self.blind += 1
             if self.blind > self.max_blind:

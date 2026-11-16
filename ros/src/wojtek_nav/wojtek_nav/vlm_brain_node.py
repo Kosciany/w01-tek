@@ -62,15 +62,20 @@ from std_msgs.msg import Empty, String
 from tf2_ros import Buffer, TransformListener
 
 from wojtek_nav.vlm_brain import (
+    CONCEPT_SCHEMA,
     DEFAULT_MODEL,
     DEFAULT_URL,
     SCHEMA,
     SYSTEM,
     VERIFY_SCHEMA,
     Explorer,
+    answer_from_detections,
     chat_url,
+    concept_prompt,
+    detect_url,
     normalised_point,
     parse_answer,
+    parse_concept,
     pixel_ray,
     ray_heading,
     step_along,
@@ -110,6 +115,13 @@ class VlmBrainNode(Node):
         p("max_s", 600.0)
         p("frame_max_age_s", 0.8)
         p("request_timeout_s", 180.0)
+        p("detector_url", "")           # "": VLM-only; else scripts/sam3_server.py's base URL
+        p("detector_threshold", 0.5)    # SAM3 instance score to count as seen
+        p("detector_timeout_s", 60.0)
+        # A detector miss asks the VLM too: SAM3 is fast and places a
+        # precise point, but in the sim it missed the textured crate that
+        # the VLM found. false trusts the detector's not_visible alone.
+        p("detector_fallback", True)
         g = lambda n: self.get_parameter(n).value  # noqa: E731
         self._g = g
         self.frame = None             # sensor_msgs Image or CompressedImage, the latest
@@ -124,6 +136,7 @@ class VlmBrainNode(Node):
         # set but blank (a .env line left empty, `export VLM_URL=`).
         self.model = g("model") or DEFAULT_MODEL
         self.endpoint = chat_url(g("url") or DEFAULT_URL)
+        self.detector = detect_url(g("detector_url")) if g("detector_url").strip() else None
         latched = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                              durability=DurabilityPolicy.TRANSIENT_LOCAL)
         if g("compressed"):
@@ -157,7 +170,8 @@ class VlmBrainNode(Node):
         self.tfl = TransformListener(self.tf, self, spin_thread=False)
         self.step_no = 0
         self.get_logger().info(
-            f"vlm brain up: {self.model} at {self.endpoint}, pictures from {self.image_topic}")
+            f"vlm brain up: {self.model} at {self.endpoint}, pictures from {self.image_topic}, "
+            f"detector {self.detector or 'off'}")
         self.status(action="idle")
 
     # -- plumbing --------------------------------------------------------
@@ -255,15 +269,18 @@ class VlmBrainNode(Node):
     # -- the model -------------------------------------------------------
 
     def ask(self, frame, text, schema, max_tokens=60):
-        """-> (the answer as a dict, seconds taken, the JPEG the model saw)."""
-        jpeg = self.jpeg_of(frame)
+        """-> (the answer as a dict, seconds taken, the JPEG the model saw).
+        frame None asks about the text alone (the concept question)."""
+        jpeg = None if frame is None else self.jpeg_of(frame)
+        content = [{"type": "text", "text": text}]
+        if jpeg is not None:
+            content.insert(0, {"type": "image_url", "image_url": {
+                "url": "data:image/jpeg;base64," + base64.b64encode(jpeg).decode()}})
         body = {
             "model": self.model, "temperature": 0.0, "max_tokens": max_tokens,
             "messages": [
                 {"role": "system", "content": SYSTEM},
-                {"role": "user", "content": [
-                    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(jpeg).decode()}},
-                    {"type": "text", "text": text}]},
+                {"role": "user", "content": content},
             ],
             "response_format": {"type": "json_schema", "json_schema": {"name": "nav", "schema": schema, "strict": True}},
         }
@@ -280,6 +297,73 @@ class VlmBrainNode(Node):
             # an unreachable server does, the node stays up.
             raise RuntimeError(f"malformed model response ({exc!r}): {str(out)[:200]}") from exc
         return parse_answer(content or ""), time.perf_counter() - t0, jpeg
+
+    def detect(self, frame, concept, near=None):
+        """SAM3 on the frame -> (a task answer from its instances, seconds
+        taken, the JPEG it saw, how many instances came back). `near`: pick
+        the instance closest to this normalised point, not the best score."""
+        jpeg = self.jpeg_of(frame)
+        body = {"image": base64.b64encode(jpeg).decode(), "prompt": concept,
+                "threshold": float(self._g("detector_threshold"))}
+        req = urllib.request.Request(self.detector, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        t0 = time.perf_counter()
+        with urllib.request.urlopen(req, timeout=self._g("detector_timeout_s")) as r:
+            out = json.load(r)
+        dets = out.get("detections") if isinstance(out, dict) else None
+        if not isinstance(dets, list):
+            raise RuntimeError(f"malformed detector response: {str(out)[:200]}")
+        answer = answer_from_detections(dets, concept, float(self._g("detector_threshold")), near)
+        return answer, time.perf_counter() - t0, jpeg, len(dets)
+
+    def concept_for(self, instruction):
+        """The detector phrase for this task, or None (no detector, or no
+        concrete object in the instruction): asked once, text only."""
+        if self.detector is None:
+            return None
+        answer, dt, _ = self.ask(None, concept_prompt(instruction), CONCEPT_SCHEMA, 40)
+        concept = parse_concept(answer)
+        self.status(action="concept", answer=answer, concept=concept, latency_s=round(dt, 2))
+        return concept
+
+    def look(self, frame, instruction, concept):
+        """One look -> (answer, seconds, JPEG, its source). With a concept
+        the detector looks first. The VLM looks instead when the detector
+        fails (reported), and also after a miss when detector_fallback is
+        on; the seconds then cover both."""
+        spent, source = 0.0, "vlm"
+        if concept is not None:
+            try:
+                answer, dt, jpeg, n = self.detect(frame, concept)
+                answer["instances"] = n
+                if answer.get("type") == "goal" or not self._g("detector_fallback"):
+                    return answer, dt, jpeg, "sam3"
+                spent, source = dt, "sam3_miss+vlm"
+            except (RuntimeError, OSError, http.client.HTTPException, ValueError) as exc:
+                self.status(action="detector_error", error=f"{type(exc).__name__}: {exc}")
+        answer, dt, jpeg = self.ask(frame, task_prompt(instruction), SCHEMA)
+        return answer, dt + spent, jpeg, source
+
+    def refresh_target(self, frame, concept, ex, action):
+        """The verified goal on a fresh picture: the resolver pairs the
+        pixel with depth near its picture's stamp and keeps only the last
+        15 s, and a slow verify outlives that (seen in the sim: ~16 s, every
+        goal `no_frame`). The detector re-finds the target in ~0.25 s.
+        -> (the frame to send with, the goal action). A miss or a failure
+        keeps the verified picture and pixel."""
+        try:
+            fresh = self.fresh_frame()
+            answer, dt, _, _ = self.detect(fresh, concept, near=action[1])
+        except (RuntimeError, OSError, http.client.HTTPException, ValueError) as exc:
+            self.status(action="refresh", result="error", error=f"{type(exc).__name__}: {exc}")
+            return frame, action
+        point = normalised_point(answer) if answer.get("type") == "goal" else None
+        age = Time.from_msg(fresh.header.stamp).nanoseconds * 1e-9 - Time.from_msg(frame.header.stamp).nanoseconds * 1e-9
+        self.status(action="refresh", result="found" if point else "missed",
+                    answer=answer, latency_s=round(dt, 2), picture_age_s=round(age, 2))
+        if point is None:
+            return frame, action
+        return fresh, ex.retarget(point)
 
     def annotate(self, jpeg, frame, point=None, text=""):
         """The picture the model answered on, with its point drawn, to
@@ -398,6 +482,7 @@ class VlmBrainNode(Node):
         frame = None
         self._running = True
         try:
+            concept = self.concept_for(instruction)
             while True:
                 # Deliver what arrived during a model call (ask() does not
                 # spin), then honour it before the next step moves anything.
@@ -421,18 +506,20 @@ class VlmBrainNode(Node):
                 if kind == "look":
                     self.step_no += 1
                     frame = self.fresh_frame()
-                    answer, dt, jpeg = self.ask(frame, task_prompt(instruction), SCHEMA)
+                    answer, dt, jpeg, source = self.look(frame, instruction, concept)
                     # The checked point, never the raw point_2d: a malformed
                     # one draws no marker instead of killing the node.
                     point = normalised_point(answer) if answer.get("type") == "goal" else None
                     self.annotate(jpeg, frame, point,
-                                  f"#{self.step_no} {answer.get('type')} {answer.get('label', '')} ({dt:.1f}s)")
-                    self.status(action="ask", answer=answer, latency_s=round(dt, 2))
+                                  f"#{self.step_no} {source} {answer.get('type')} {answer.get('label', '')} ({dt:.1f}s)")
+                    self.status(action="ask", source=source, answer=answer, latency_s=round(dt, 2))
                     action = ex.on_answer(answer)
                 elif kind == "verify":
                     v, dt, _ = self.ask(frame, verify_prompt(instruction, action[1]), VERIFY_SCHEMA, 20)
                     self.status(action="verify", answer=v, latency_s=round(dt, 2))
                     action = ex.on_verified(bool(v.get("visible")))
+                    if action[0] == "goal" and concept is not None:
+                        frame, action = self.refresh_target(frame, concept, ex, action)
                 elif kind == "goal":
                     res = self.send_pixel(frame, action[1])
                     dist = self.distance_to_target()

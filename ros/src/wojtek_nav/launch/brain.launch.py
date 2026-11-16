@@ -14,7 +14,9 @@ kilobytes a frame, not the raw image's megabytes.
 
 `url` is the Ollama server's base URL, with or without /v1; the model is
 qwen3-vl:30b-a3b-instruct. The environment's VLM_URL and VLM_MODEL (see
-.env.example) are the usual source of both.
+.env.example) are the usual source of both. `detector_url` (DETECTOR_URL)
+optionally adds the SAM3 detector, scripts/sam3_server.py: the VLM names
+the object once per task and SAM3 finds it in each picture.
 """
 
 from launch import LaunchDescription
@@ -44,6 +46,14 @@ def generate_launch_description():
                             "environment when set.",
             ),
             DeclareLaunchArgument(
+                "detector_url",
+                default_value=EnvironmentVariable("DETECTOR_URL", default_value=""),
+                description="Base URL of the SAM3 detector "
+                            "(scripts/sam3_server.py); DETECTOR_URL from "
+                            "the environment when set; empty keeps the "
+                            "brain VLM-only.",
+            ),
+            DeclareLaunchArgument(
                 "instruction", default_value="",
                 description="A task to run at start; later ones arrive on "
                             "wojtek/vlm/instruction (the web console's brain "
@@ -71,6 +81,9 @@ def generate_launch_description():
                 parameters=[{
                     "url": ParameterValue(LaunchConfiguration("url"), value_type=str),
                     "model": ParameterValue(LaunchConfiguration("model"), value_type=str),
+                    "detector_url": ParameterValue(
+                        LaunchConfiguration("detector_url"), value_type=str
+                    ),
                     "instruction": ParameterValue(
                         LaunchConfiguration("instruction"), value_type=str
                     ),

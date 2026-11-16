@@ -20,6 +20,8 @@
 #                              container cannot see host paths, so those are
 #                              dropped
 #   VLM_URL, VLM_MODEL         the VLM brain's model server (Ollama)
+#   DETECTOR_URL               the brain's optional SAM3 detector
+#                              (wojtek_nav/scripts/sam3_server.py)
 #   ROS_LOCALHOST_ONLY         1 on a host whose Docker multicast loopback is
 #                              broken (a headless GPU box: `ros2 node list`
 #                              hangs, nodes in one container never find each
@@ -32,7 +34,7 @@
 #                              cgl, or any other name, is dropped with a
 #                              message and the container keeps egl
 
-WOJTEK_FORWARD_VARS="${WOJTEK_FORWARD_VARS:-HF_ORGANIZATION HF_TOKEN WOJTEK_POLICY VLM_URL VLM_MODEL ROS_LOCALHOST_ONLY MUJOCO_GL}"
+WOJTEK_FORWARD_VARS="${WOJTEK_FORWARD_VARS:-HF_ORGANIZATION HF_TOKEN WOJTEK_POLICY VLM_URL VLM_MODEL DETECTOR_URL ROS_LOCALHOST_ONLY MUJOCO_GL}"
 
 forward_env() {
   local var val envfile

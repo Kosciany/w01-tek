@@ -41,8 +41,11 @@ Start with the [documentation home](docs/README.md) for task guides and
   tree.
 - The VLM brain (`ros/src/wojtek_nav`) has one model server: Ollama serving
   `qwen3-vl:30b-a3b-instruct` on port 11434 (OpenAI-compatible, `/v1`),
-  reached through `VLM_URL`/`VLM_MODEL` in the gitignored `.env`. See the
-  [navigation guide](ros/src/wojtek_nav/README.md) for its setup and limits.
+  reached through `VLM_URL`/`VLM_MODEL` in the gitignored `.env`. An
+  optional SAM3 detector (`ros/src/wojtek_nav/scripts/sam3_server.py`,
+  `DETECTOR_URL`) finds the object the VLM names; empty keeps it VLM-only.
+  See the [navigation guide](ros/src/wojtek_nav/README.md) for its setup
+  and limits.
 - `learning/` holds self-contained learning guides for tools and hardware
   around Wojtek (the SO-101 arms with LeRobot's web GUI, and the Colab
   notebook on training Wojtek's walking policy).  Nothing in `ros/` or

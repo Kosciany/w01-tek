@@ -143,9 +143,51 @@ before sending its pixel. Arrival is decided from execution/target distance,
 not solely the model's `done` answer.
 
 The loop explores by turning when the target is absent, can approach along the
-viewing ray when depth is unavailable, and tries a detour after blockage. Default
-budgets are 30 steps, 600 s, 8 blind approaches and 3 stalled moves. These bound
-an attempt; they do not establish navigation reliability.
+viewing ray when depth is unavailable, and tries a detour after blockage. A pixel
+goal blocked twice in a row detours 40° off the target's bearing instead of
+turning in place. Blocked goals that leave the robot no nearer to the target
+count as stalls, like moves that make no progress. Default budgets are 30 steps,
+600 s, 8 blind approaches and 3 stalls in a row. These bound an attempt; they do
+not establish navigation reliability.
+
+### Optional SAM3 detector
+
+`detector_url` (`DETECTOR_URL` in the repo-root `.env`) adds a SAM3 detector,
+`scripts/sam3_server.py`. Leave it empty for VLM-only behaviour. With a detector
+configured:
+
+1. At task start, the VLM turns the instruction into a short English noun phrase
+   (`purple pillar`), or reports that the task has no concrete object. Status
+   reports this as `action: "concept"`.
+2. Each look runs SAM3 on the frame. A detection becomes a goal on the mask's
+   deepest interior pixel. The VLM still verifies it before anything moves.
+3. After verification, SAM3 finds the same instance again in a fresh frame. The
+   pixel goal then carries a current stamp even if verification was slow. The
+   resolver keeps only 15 s of depth.
+4. If SAM3 misses, the VLM also looks (`detector_fallback`, default on). If the
+   detector fails, the VLM looks instead and status reports `detector_error`.
+
+Run the server on the model host, next to Ollama. `facebook/sam3` is gated:
+request access on Hugging Face and log in first. Then run:
+
+```bash
+uv run ros/src/wojtek_nav/scripts/sam3_server.py   # http://127.0.0.1:8100
+```
+
+It selects CUDA with bfloat16 when a GPU is available, otherwise the CPU with
+float32. Stock-sim measurements from 2026-11-16:
+
+- RTX 3060 Ti: about 0.25 s per frame.
+- CPU: about 14 s per frame, too slow for the 15 s depth window.
+
+An 8 GB card cannot hold SAM3 together with the full GPU share of
+`qwen3-vl:30b-a3b-instruct`. The GB10 deployment target has not been measured.
+
+On ten stock-sim frames, SAM3 found the purple pillar in all five frames that
+contained it, with no false hits. It also reported no red chair in any frame.
+It did not find the textured crate under `orange crate`, `wooden crate` or
+`cardboard box`. The VLM did find the crate, which is why the fallback is on
+by default.
 
 `/wojtek/vlm/status` carries latched JSON in `std_msgs/String`. Common fields are
 `step`, `instruction`, `t` and `action`; action-specific fields include `result`,

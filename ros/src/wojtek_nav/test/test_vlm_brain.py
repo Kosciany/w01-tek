@@ -5,11 +5,16 @@ import math
 import pytest
 
 from wojtek_nav.vlm_brain import (
+    CONCEPT_SCHEMA,
     Explorer,
     SCHEMA,
+    answer_from_detections,
     chat_url,
+    concept_prompt,
+    detect_url,
     normalised_point,
     parse_answer,
+    parse_concept,
     pixel_ray,
     ray_heading,
     rotate,
@@ -287,87 +292,126 @@ def test_step_along():
     assert step_along((1.0, 2.0), math.pi / 2, 1.5) == pytest.approx((1.0, 3.5))
 
 
-def test_blocked_goal_looks_again_then_turns_instead_of_pushing_again():
-    e = Explorer()
-    _pointed(e)
-    assert e.on_goal_result("blocked", distance_m=1.3) == ("look",)  # re-resolve from here
-    _pointed(e)
-    assert e.on_goal_result("blocked", distance_m=1.3) == ("search", 45.0)
-    _pointed(e)
-    assert e.on_goal_result("blocked", distance_m=1.3) == ("look",)  # the count restarted
-
-
-def test_reached_goal_clears_the_block_count():
-    e = Explorer()
-    _pointed(e)
-    e.on_goal_result("blocked", distance_m=2.0)
-    _pointed(e)
-    e.on_goal_result("reached", distance_m=1.5)
-    _pointed(e)
-    assert e.on_goal_result("blocked", distance_m=1.3) == ("look",)
-
-
-def _turn_between(e):
-    assert e.on_answer({"type": "not_visible"}) == ("search", 45.0)
+def test_blocked_goal_looks_again_then_detours_instead_of_pushing_again():
+    e = Explorer(detour_deg=40, max_steps=100)
+    _pointed(e, (600, 300))
+    assert e.on_goal_result("blocked", distance_m=2.7) == ("look",)  # re-resolve from here
+    _pointed(e, (600, 300))
+    # Round the obstacle along the pixel's bearing, not a search turn that
+    # leaves the target in the picture and the next goal on the same line.
+    assert e.on_goal_result("blocked", distance_m=2.4) == ("approach", 1.0, (0.6, 0.3), 40.0)
+    # The detour ends turned back onto the bearing.
+    assert e.on_move_result("reached", moved_m=1.0) == ("search", -40.0)
     e.turn_done()
-
-
-def _model_turn_between(e):
-    assert e.on_answer({"type": "turn", "deg": -30}) == ("search", -30.0)
-    e.turn_done()
-
-
-def _approach_between(e):
     _pointed(e)
-    assert e.on_goal_result("no_depth")[0] == "approach"
-    assert e.on_move_result("reached", moved_m=1.0) == ("look",)
+    assert e.on_goal_result("blocked", distance_m=2.0) == ("look",)  # the count restarted
 
 
-def _timeout_between(e):
+def test_repeated_blocked_goal_detours_alternate_sides():
+    e = Explorer(detour_deg=40, max_steps=100)
+    sides = []
+    for dist in (3.0, 2.5, 2.0):  # progress each time: no stall
+        _pointed(e)
+        e.on_goal_result("blocked", distance_m=dist + 0.2)
+        _pointed(e)
+        sides.append(e.on_goal_result("blocked", distance_m=dist)[3])
+        e.on_move_result("blocked", moved_m=0.6)
+        e.turn_done()
+    assert sides == [40.0, -40.0, 40.0]
+
+
+def test_blocked_goals_that_get_no_nearer_give_up_with_a_reason():
+    """The 2026-11-16 sim run: blocked 1.6 m from the pillar, every look
+    pointing at it again, until the 600 s budget. Now it ends early."""
+    e = Explorer(min_progress_m=0.25, max_stalls=3, max_steps=100)
     _pointed(e)
-    assert e.on_goal_result("timeout") == ("search", 45.0)
+    assert e.on_goal_result("blocked", distance_m=1.78) == ("look",)
+    _pointed(e)
+    assert e.on_goal_result("blocked", distance_m=1.68)[0] == "approach"  # stall 1
+    e.on_move_result("blocked", moved_m=0.4)
     e.turn_done()
+    _pointed(e)
+    assert e.on_goal_result("blocked", distance_m=1.74) == ("look",)  # stall 2
+    _pointed(e)
+    kind, why = e.on_goal_result("blocked", distance_m=1.63)  # stall 3
+    assert kind == "gave_up" and "no progress" in why and "1.78" in why
 
 
-@pytest.mark.parametrize("between", [_turn_between, _model_turn_between, _approach_between, _timeout_between])
-def test_only_a_block_straight_after_a_look_counts_twice(between):
-    """A turn, a walk or another result between two blocks: the robot has
-    moved or the picture changed, so the second block gets its own fresh
-    look too."""
+def test_progress_towards_the_target_clears_the_goal_stall_count():
+    e = Explorer(min_progress_m=0.25, max_stalls=2, max_steps=100)
+    for first, second in ((2.7, 2.65), (2.3, 2.25), (1.9, 1.85)):
+        _pointed(e)
+        assert e.on_goal_result("blocked", distance_m=first) == ("look",)
+        _pointed(e)
+        assert e.on_goal_result("blocked", distance_m=second)[0] == "approach"
+        e.on_move_result("reached", moved_m=1.0)
+        e.turn_done()
+
+
+def test_unknown_distance_is_not_a_goal_stall():
+    e = Explorer(max_stalls=1, max_steps=100)
+    for _ in range(4):
+        _pointed(e)
+        assert e.on_goal_result("blocked")[0] != "gave_up"
+
+
+# -- the optional SAM3 detector ------------------------------------------
+
+
+@pytest.mark.parametrize("base", ["http://box:8100", "http://box:8100/", "http://box:8100/detect"])
+def test_detect_url_takes_a_base_url(base):
+    assert detect_url(base) == "http://box:8100/detect"
+
+
+def test_concept_prompt_carries_the_instruction_and_asks_for_english():
+    p = concept_prompt("podejdź do fioletowego słupa")
+    assert "podejdź do fioletowego słupa" in p and "English" in p
+    assert CONCEPT_SCHEMA["required"] == ["detectable", "prompt"]
+
+
+@pytest.mark.parametrize("answer,concept", [
+    ({"detectable": True, "prompt": "purple pillar"}, "purple pillar"),
+    ({"detectable": True, "prompt": "  \"red   chair\". "}, "red chair"),
+    ({"detectable": False, "prompt": "corridor"}, None),
+    ({"detectable": True, "prompt": ""}, None),
+    ({"detectable": True, "prompt": "walk to the end of the long corridor and stop"}, None),
+    ({"detectable": "true", "prompt": "pillar"}, None),  # a string is not a yes
+    ({"detectable": True, "prompt": 5}, None),
+    ({"type": "unparsable"}, None),
+    ("pillar", None),
+])
+def test_parse_concept(answer, concept):
+    assert parse_concept(answer) == concept
+
+
+def test_most_confident_detection_becomes_a_goal_the_explorer_verifies():
+    dets = [{"score": 0.62, "point": [0.2, 0.4]}, {"score": 0.91, "point": [0.55, 0.25]}]
+    a = answer_from_detections(dets, "purple pillar", min_score=0.5)
+    assert a == {"type": "goal", "point_2d": [550, 250], "label": "purple pillar", "score": 0.91}
     e = Explorer()
-    _pointed(e)
-    assert e.on_goal_result("blocked", distance_m=1.8) == ("look",)
-    between(e)
-    _pointed(e)
-    assert e.on_goal_result("blocked", distance_m=1.8) == ("look",)  # a fresh look, not a turn
+    assert e.on_answer(a) == ("verify", "purple pillar")  # still asked before it moves
+    assert e.on_verified(True) == ("goal", (0.55, 0.25))
 
 
-def test_time_budget_gives_up_with_a_reason():
-    e = Explorer(max_s=10.0)
-    assert e.out_of_time(("look",), 9.9) == ("look",)
-    kind, why = e.out_of_time(("search", 45.0), 10.0)
-    assert kind == "gave_up" and "time budget" in why and "10 s" in why
+@pytest.mark.parametrize("dets", [
+    [], None, "x", [{"score": 0.3, "point": [0.5, 0.5]}],
+    [{"score": 0.9}], [{"score": 0.9, "point": [1.5, 0.5]}], [{"score": "high", "point": [0.5, 0.5]}],
+    [{"score": float("nan"), "point": [0.5, 0.5]}], [{"score": 0.9, "point": [float("nan"), 0.5]}],
+    [{"score": 0.9, "point": [0.5]}], [None],
+])
+def test_no_usable_detection_is_not_visible(dets):
+    assert answer_from_detections(dets, "pillar", min_score=0.5) == {"type": "not_visible"}
+    assert Explorer(turn_deg=45).on_answer({"type": "not_visible"}) == ("search", 45.0)
 
 
-def test_a_step_that_ends_the_task_late_keeps_its_result():
-    e = Explorer(max_s=10.0)
-    assert e.out_of_time(("done",), 50.0) == ("done",)
-    late = ("gave_up", "no progress: 3 moves in a row covered less than 0.25 m each")
-    assert e.out_of_time(late, 50.0) == late
+def test_refresh_picks_the_instance_nearest_the_verified_one():
+    dets = [{"score": 0.97, "point": [0.9, 0.2]}, {"score": 0.80, "point": [0.45, 0.3]}]
+    assert answer_from_detections(dets, "pillar", near=(0.5, 0.3))["point_2d"] == [450, 300]
+    assert answer_from_detections(dets, "pillar")["point_2d"] == [900, 200]
 
 
-def test_time_budget_default_matches_the_node():
-    assert Explorer().max_s == 600.0
-
-
-def test_gives_up_after_max_steps():
-    e = Explorer(max_steps=2)
-    e.on_answer({"type": "not_visible"})
-    e.on_answer({"type": "not_visible"})
-    kind, why = e.on_answer({"type": "not_visible"})
-    assert kind == "gave_up" and "step budget" in why
-
-
-@pytest.mark.parametrize("bad", [{"type": "unparsable"}, {"type": "goal"}, {"type": "goal", "point_2d": [2000, 0]}])
-def test_garbage_answers_search(bad):
-    assert Explorer().on_answer(bad) == ("search", 45.0)
+def test_retarget_moves_the_goal_and_the_approach_to_the_fresh_pixel():
+    e = Explorer(approach_m=1.0)
+    _pointed(e, (500, 500))
+    assert e.retarget((0.52, 0.48)) == ("goal", (0.52, 0.48))
+    assert e.on_goal_result("no_depth") == ("approach", 1.0, (0.52, 0.48), 0.0)

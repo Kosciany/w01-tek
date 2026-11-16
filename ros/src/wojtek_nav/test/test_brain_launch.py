@@ -24,8 +24,10 @@ def launch_mod():
     return module
 
 
-def _node_params(launch_mod, monkeypatch, env_url=None, env_model=None, **overrides):
-    for var, val in (("VLM_URL", env_url), ("VLM_MODEL", env_model)):
+def _node_params(launch_mod, monkeypatch, env_url=None, env_model=None, env_detector=None,
+                 **overrides):
+    for var, val in (("VLM_URL", env_url), ("VLM_MODEL", env_model),
+                     ("DETECTOR_URL", env_detector)):
         if val is None:
             monkeypatch.delenv(var, raising=False)
         else:
@@ -54,6 +56,7 @@ def test_defaults_are_the_30b_on_ollama_over_the_compressed_picture(launch_mod, 
     assert params["compressed"] is True
     assert params["image_topic"] == "/camera/camera/color/image_raw"
     assert params["instruction"] == ""
+    assert params["detector_url"] == ""  # VLM-only unless a detector is named
 
 
 def test_vlm_url_and_model_from_the_environment_are_the_defaults(launch_mod, monkeypatch):
@@ -73,6 +76,14 @@ def test_arguments_reach_the_node(launch_mod, monkeypatch):
     assert params["model"] == "qwen3-vl:30b"
     assert params["compressed"] is False
     assert params["instruction"] == "podejdź do fioletowego słupa"
+
+
+def test_detector_url_from_the_environment_or_the_argument(launch_mod, monkeypatch):
+    _, params = _node_params(launch_mod, monkeypatch, env_detector="http://127.0.0.1:8100")
+    assert params["detector_url"] == "http://127.0.0.1:8100"
+    _, params = _node_params(launch_mod, monkeypatch, env_detector="http://ignored:1",
+                             detector_url="http://box:8100")
+    assert params["detector_url"] == "http://box:8100"
 
 
 @pytest.mark.parametrize("target", [None, "/wojtek/cmd_vel/brain"])
