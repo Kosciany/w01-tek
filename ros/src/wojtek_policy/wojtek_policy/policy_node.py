@@ -81,9 +81,6 @@ class PolicyNode(Node):
         # (tau_ff.limit, else tau_ff.scale).
         self.declare_parameter("tau_ff_limit", 0.0)
         # Output low-pass for apt policies (1.0 = off); read every tick, so
-        # `ros2 param set /wojtek_policy output_lpf_alpha 0.5` acts live.
-        self.declare_parameter("output_lpf_alpha", 1.0)
-        # Output low-pass for apt policies (1.0 = off); read every tick, so
         # `ros2 param set /wojtek_policy output_lpf_alpha 0.72` acts live.
         self.declare_parameter("output_lpf_alpha", 1.0)
         self.declare_parameter("auto_enable", True)
