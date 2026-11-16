@@ -247,6 +247,16 @@ container, capture one matched pair at a time:
 python3 /ros2_ws/src/wojtek_nav/scripts/capture_frames.py --out /tmp/wojtek-point-frames
 ```
 
+For a guided multi-frame session, with the simulation already running, use:
+
+```bash
+bash /ros2_ws/src/wojtek_nav/scripts/capture_session.sh /tmp/wojtek-point-frames
+```
+
+Move the robot to a new view, let it settle, and press Enter to capture; press
+`q` to finish. The helper does not start the simulation. It saves each frame
+using the same format as the single-frame command above.
+
 Each call appends a JPEG, depth array in millimetres and intrinsics/timestamps to
 `index.json`. It refuses timestamp skew above 0.1 s by default and writes no
 object labels. Use one capture process at a time. Move to another test view,

@@ -77,7 +77,10 @@ def main(argv=None):
     subscriptions = [
         node.create_subscription(CompressedImage, args.colour_topic,
                                  lambda msg: frames.update(colour=msg), qos_profile_sensor_data),
-        node.create_subscription(RosImage, args.depth_topic, depths.append, qos_profile_sensor_data),
+        # A lambda, not depths.append: Jazzy's rclpy inspects the callback's
+        # signature, and a builtin method has none (ValueError at startup).
+        node.create_subscription(RosImage, args.depth_topic,
+                                 lambda msg: depths.append(msg), qos_profile_sensor_data),
         node.create_subscription(CameraInfo, args.colour_info,
                                  lambda msg: frames.update(colour_info=msg), qos_profile_sensor_data),
         node.create_subscription(CameraInfo, args.depth_info,
